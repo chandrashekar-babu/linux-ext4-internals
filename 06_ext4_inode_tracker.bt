@@ -1,0 +1,172 @@
+
+#!/usr/bin/env bpftrace
+/*
+ * ext4_inode_tracker.bt - Track inode operations
+ * 
+ * Tracks: inode allocation, freeing, eviction, dirty state
+ * Usage: bpftrace ext4_inode_tracker.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Inode Tracker Started ===\n");
+}
+
+// Track inode allocation
+kprobe:ext4_new_inode
+{
+    $dir = (struct inode *)arg1;
+    $mode = arg2;
+    
+    @inode_allocations = count();
+    @inode_alloc_mode[comm, $mode] = count();
+    
+    printf("[%u] Inode allocation: mode=0x%x, dir_ino=%d\n", 
+           elapsed / 1e6, $mode, $dir->i_ino);
+}
+
+kretprobe:ext4_new_inode
+{
+    $inode = (struct inode *)retval;
+    if ($inode != 0) {
+        @inode_alloc_success = count();
+        @inode_alloc_ino[$inode->i_ino] = nsecs;
+        
+        printf("[%u] Inode allocated: ino=%d\n", 
+               elapsed / 1e6, $inode->i_ino);
+    } else {
+        @inode_alloc_failures = count();
+    }
+}
+
+// Track inode freeing
+kprobe:ext4_free_inode
+{
+    $inode = (struct inode *)arg0;
+    
+    @inode_frees = count();
+    @inode_lifetime[comm] = nsecs - @inode_alloc_ino[$inode->i_ino];
+    
+    printf("[%u] Inode freed: ino=%d\n", 
+           elapsed / 1e6, $inode->i_ino);
+    
+    delete(@inode_alloc_ino[$inode->i_ino]);
+}
+
+// Track inode eviction
+kprobe:ext4_evict_inode
+{
+    $inode = (struct inode *)arg0;
+    
+    @inode_evictions = count();
+    @eviction_by_proc[comm] = count();
+    
+    printf("[%u] Inode evicted: ino=%d, nlink=%d\n", 
+           elapsed / 1e6, $inode->i_ino, $inode->i_nlink);
+}
+
+// Track inode dirty marking
+kprobe:ext4_mark_inode_dirty
+{
+    $inode = (struct inode *)arg1;
+    
+    @inode_dirty_marks = count();
+    @inode_dirty_by_proc[comm] = count();
+}
+
+// Track inode read
+kprobe:ext4_iget
+{
+    $sb = (struct super_block *)arg0;
+    $ino = arg1;
+    
+    @inode_reads = count();
+    
+    printf("[%u] Inode read: ino=%d\n", elapsed / 1e6, $ino);
+}
+
+// Track inode writeback
+kprobe:ext4_write_inode
+{
+    $inode = (struct inode *)arg0;
+    $wait = arg1;
+    
+    @inode_writebacks = count();
+    @inode_writeback_wait = $wait ? @inode_writeback_wait + 1 : @inode_writeback_wait;
+}
+
+// Track inode cache pressure
+kprobe:ext4_inode_cache_shrink
+{
+    @inode_shrink_calls = count();
+}
+
+kretprobe:ext4_inode_cache_shrink
+{
+    @inode_shrunk = sum(retval);
+}
+
+// Track inode flags changes
+kprobe:ext4_ioctl_setflags
+{
+    $inode = (struct inode *)arg1;
+    $flags = arg2;
+    
+    @flag_changes = count();
+    @flags_by_proc[comm, $flags] = count();
+    
+    printf("[%u] Inode flags changed: ino=%d, flags=0x%x\n", 
+           elapsed / 1e6, $inode->i_ino, $flags);
+}
+
+// Periodic reporting
+interval:s:15
+{
+    printf("\n=== Inode Report (15s) ===\n");
+    printf("Allocations: %d (success: %d, failures: %d)\n", 
+           @inode_allocations, @inode_alloc_success, @inode_alloc_failures);
+    printf("Frees: %d\n", @inode_frees);
+    printf("Evictions: %d\n", @inode_evictions);
+    printf("Reads: %d\n", @inode_reads);
+    printf("Writebacks: %d (wait: %d)\n", @inode_writebacks, @inode_writeback_wait);
+    printf("Dirty Marks: %d\n", @inode_dirty_marks);
+    printf("Flag Changes: %d\n", @flag_changes);
+    printf("Shrinker Calls: %d, Shrunk: %d\n", @inode_shrink_calls, @inode_shrunk);
+    
+    // Reset counters
+    @inode_allocations = 0;
+    @inode_alloc_success = 0;
+    @inode_alloc_failures = 0;
+    @inode_frees = 0;
+    @inode_evictions = 0;
+    @inode_reads = 0;
+    @inode_writebacks = 0;
+    @inode_writeback_wait = 0;
+    @inode_dirty_marks = 0;
+    @flag_changes = 0;
+    @inode_shrink_calls = 0;
+    @inode_shrunk = 0;
+}
+
+END {
+    printf("\n=== Final Inode Statistics ===\n");
+    printf("\nInode allocation modes by process:\n");
+    print(@inode_alloc_mode);
+    
+    printf("\nInode evictions by process:\n");
+    print(@eviction_by_proc);
+    
+    printf("\nInode dirty marks by process:\n");
+    print(@inode_dirty_by_proc);
+    
+    printf("\nInode lifetime (ns):\n");
+    print(@inode_lifetime);
+    
+    printf("\nFlag changes by process:\n");
+    print(@flags_by_proc);
+    
+    clear(@inode_alloc_mode);
+    clear(@eviction_by_proc);
+    clear(@inode_dirty_by_proc);
+    clear(@inode_lifetime);
+    clear(@flags_by_proc);
+}

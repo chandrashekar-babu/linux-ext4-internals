@@ -1,0 +1,194 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_delalloc_debug.bt - Debug delayed allocation behavior
+ * 
+ * Tracks: delalloc writes, space reservation, ENOSPC handling
+ * Usage: bpftrace ext4_delalloc_debug.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Delayed Allocation Debugger ===\n");
+    printf("WARNING: This script may have performance impact\n\n");
+}
+
+// Track delalloc write begin
+kprobe:ext4_da_write_begin
+{
+    $inode = (struct inode *)arg0;
+    $pos = arg1;
+    $len = arg2;
+    
+    @da_write_begin = count();
+    @da_write_begin_size = hist($len);
+    @da_write_begin_pos = hist($pos);
+    
+    printf("[%u] DA write begin: ino=%d, pos=%lld, len=%d\n", 
+           elapsed / 1e6, $inode->i_ino, $pos, $len);
+}
+
+kretprobe:ext4_da_write_begin
+{
+    if (retval != 0) {
+        @da_write_begin_errors = count();
+        printf("[%u] DA write begin FAILED: err=%d\n", elapsed / 1e6, retval);
+    }
+}
+
+// Track delalloc write end
+kprobe:ext4_da_write_end
+{
+    $inode = (struct inode *)arg0;
+    $pos = arg1;
+    $len = arg2;
+    $copied = arg3;
+    
+    @da_write_end = count();
+    @da_write_end_copied = hist($copied);
+    
+    printf("[%u] DA write end: ino=%d, pos=%lld, copied=%d\n", 
+           elapsed / 1e6, $inode->i_ino, $pos, $copied);
+}
+
+// Track delalloc space reservation
+kprobe:ext4_da_reserve_space
+{
+    $inode = (struct inode *)arg0;
+    $len = arg1;
+    
+    @da_reserve_calls = count();
+    @da_reserve_len = hist($len);
+    
+    printf("[%u] DA reserve: ino=%d, len=%d\n", 
+           elapsed / 1e6, $inode->i_ino, $len);
+}
+
+kretprobe:ext4_da_reserve_space
+{
+    if (retval != 0) {
+        @da_reserve_errors = count();
+        printf("[%u] DA reserve FAILED: err=%d\n", elapsed / 1e6, retval);
+    }
+}
+
+// Track delalloc writepages
+kprobe:ext4_da_writepages
+{
+    $mapping = (struct address_space *)arg0;
+    $wbc = (struct writeback_control *)arg1;
+    $inode = $mapping->host;
+    
+    @da_writepages = count();
+    @da_writepages_range = hist($wbc->range_end - $wbc->range_start);
+    
+    printf("[%u] DA writepages: ino=%d, sync_mode=%d\n", 
+           elapsed / 1e6, $inode->i_ino, $wbc->sync_mode);
+}
+
+kretprobe:ext4_da_writepages
+{
+    if (retval != 0) {
+        @da_writepages_errors = count();
+        printf("[%u] DA writepages FAILED: err=%d\n", elapsed / 1e6, retval);
+    }
+}
+
+// Track ENOSPC handling in delalloc
+kprobe:ext4_da_writepages
+/@da_writepages[tid]/
+{
+    $sbi = (struct ext4_sb_info *)EXT4_SB($inode->i_sb);
+    $free_blocks = $sbi->s_freeblocks_counter;
+    
+    if ($free_blocks < 100) {
+        @da_low_space = count();
+        printf("[%u] LOW SPACE in delalloc: free_blocks=%d\n", 
+               elapsed / 1e6, $free_blocks);
+    }
+}
+
+// Track fallback to non-delalloc
+kprobe:ext4_writepages
+/comm == "kworker"/
+{
+    @fallback_writepages = count();
+    printf("[%u] Fallback to non-delalloc writepages\n", elapsed / 1e6);
+}
+
+// Track delalloc extent conversion
+kprobe:ext4_ext_map_blocks
+{
+    $handle = (handle_t *)arg0;
+    $inode = (struct inode *)arg1;
+    $map = (struct ext4_map_blocks *)arg2;
+    $flags = arg3;
+    
+    if ($flags & EXT4_GET_BLOCKS_DELALLOC_RESERVE) {
+        @delalloc_conversions = count();
+        @delalloc_conv_len = hist($map->m_len);
+        
+        printf("[%u] Delalloc conversion: ino=%d, len=%d\n", 
+               elapsed / 1e6, $inode->i_ino, $map->m_len);
+    }
+}
+
+// Track dirty pages count
+kprobe:ext4_da_writepages
+{
+    $mapping = (struct address_space *)arg0;
+    $inode = $mapping->host;
+    
+    // Count dirty pages in this inode
+    @dirty_pages[$inode->i_ino] = count();
+}
+
+interval:s:10
+{
+    printf("\n=== Delalloc Report (10s) ===\n");
+    printf("Write Begin: %d (errors: %d)\n", @da_write_begin, @da_write_begin_errors);
+    printf("Write End: %d\n", @da_write_end);
+    printf("Reserve Calls: %d (errors: %d)\n", @da_reserve_calls, @da_reserve_errors);
+    printf("Writepages: %d (errors: %d)\n", @da_writepages, @da_writepages_errors);
+    printf("Fallback to non-delalloc: %d\n", @fallback_writepages);
+    printf("Delalloc Conversions: %d\n", @delalloc_conversions);
+    printf("Low Space Events: %d\n", @da_low_space);
+    
+    printf("\nTop 10 inodes by dirty pages:\n");
+    print(@dirty_pages, 10);
+    
+    // Reset counters
+    @da_write_begin = 0;
+    @da_write_begin_errors = 0;
+    @da_write_end = 0;
+    @da_reserve_calls = 0;
+    @da_reserve_errors = 0;
+    @da_writepages = 0;
+    @da_writepages_errors = 0;
+    @fallback_writepages = 0;
+    @delalloc_conversions = 0;
+    @da_low_space = 0;
+    clear(@dirty_pages);
+}
+
+END {
+    printf("\n=== Final Delalloc Statistics ===\n");
+    printf("\nWrite Begin Sizes (bytes):\n");
+    print(@da_write_begin_size);
+    
+    printf("\nWrite End Copied (bytes):\n");
+    print(@da_write_end_copied);
+    
+    printf("\nReserve Request Sizes (blocks):\n");
+    print(@da_reserve_len);
+    
+    printf("\nWritepages Range (bytes):\n");
+    print(@da_writepages_range);
+    
+    printf("\nDelalloc Conversion Sizes (blocks):\n");
+    print(@delalloc_conv_len);
+    
+    clear(@da_write_begin_size);
+    clear(@da_write_end_copied);
+    clear(@da_reserve_len);
+    clear(@da_writepages_range);
+    clear(@delalloc_conv_len);
+}

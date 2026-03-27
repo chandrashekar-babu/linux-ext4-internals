@@ -1,0 +1,181 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_fragmentation_detector.bt - Detect filesystem fragmentation
+ * 
+ * Tracks: extent sizes, allocation patterns, fragment counts
+ * Usage: bpftrace ext4_fragmentation_detector.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Fragmentation Detector ===\n");
+    printf("Monitoring extent sizes and allocation patterns\n\n");
+}
+
+// Track extent sizes when allocated
+kprobe:ext4_ext_insert_extent
+{
+    $ext = (struct ext4_extent *)arg2;
+    $len = $ext->ee_len;
+    
+    @extent_sizes = hist($len);
+    
+    if ($len < 8) {
+        @small_extents = count();
+        printf("[%u] SMALL EXTENT: len=%d blocks\n", elapsed / 1e6, $len);
+    }
+}
+
+// Track extent merges (good for fragmentation)
+kprobe:ext4_ext_try_to_merge
+{
+    @merge_attempts = count();
+}
+
+kretprobe:ext4_ext_try_to_merge
+{
+    if (retval == 1) {
+        @successful_merges = count();
+        printf("[%u] Extent merge successful\n", elapsed / 1e6);
+    }
+}
+
+// Track extent splits (bad for fragmentation)
+kprobe:ext4_ext_split
+{
+    @extent_splits = count();
+    printf("[%u] EXTENT SPLIT occurred\n", elapsed / 1e6);
+}
+
+// Track allocation sizes from mballoc
+kprobe:ext4_mb_new_blocks
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $len = $ac->ac_g_ex.fe_len;
+    
+    @allocation_sizes = hist($len);
+    
+    if ($len < 8) {
+        @small_allocations = count();
+    }
+}
+
+// Track contiguous allocation attempts
+kprobe:ext4_mb_find_by_order
+{
+    $cr = arg2;
+    $order = $cr;  // Higher order = larger contiguous region
+    
+    @allocation_orders[$order] = count();
+}
+
+// Track group fragmentation
+kprobe:ext4_mb_good_group
+{
+    $grp = (struct ext4_group_info *)arg1;
+    $fragments = $grp->bb_fragments;
+    
+    @group_fragments = hist($fragments);
+    
+    if ($fragments > 100) {
+        @highly_fragmented_groups = count();
+        printf("[%u] Highly fragmented group: fragments=%d\n", 
+               elapsed / 1e6, $fragments);
+    }
+}
+
+// Track block bitmap scanning
+kprobe:ext4_mb_scan_groups
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $cr = arg1;
+    
+    @scan_calls[$cr] = count();
+}
+
+// Track free space fragmentation
+kprobe:ext4_mb_discard_preallocations
+{
+    @discard_prealloc = count();
+}
+
+// Track fallback allocations (indicates fragmentation)
+kprobe:ext4_mb_regular_allocator
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $cr = $ac->ac_criteria;
+    
+    if ($cr > 2) {
+        @high_criteria_allocations = count();
+        printf("[%u] High allocation criteria used: cr=%d\n", elapsed / 1e6, $cr);
+    }
+}
+
+// Periodic reporting
+interval:s:30
+{
+    printf("\n=== Fragmentation Report (30s) ===\n");
+    printf("Extent Sizes Distribution:\n");
+    print(@extent_sizes);
+    
+    printf("\nAllocation Sizes Distribution:\n");
+    print(@allocation_sizes);
+    
+    printf("\nExtent Splits: %d\n", @extent_splits);
+    printf("Successful Merges: %d\n", @successful_merges);
+    printf("Merge Attempts: %d\n", @merge_attempts);
+    printf("Small Extents (<8 blocks): %d\n", @small_extents);
+    printf("Small Allocations (<8 blocks): %d\n", @small_allocations);
+    printf("Highly Fragmented Groups: %d\n", @highly_fragmented_groups);
+    printf("High Criteria Allocations: %d\n", @high_criteria_allocations);
+    printf("Discard Prealloc Calls: %d\n", @discard_prealloc);
+    
+    printf("\nGroup Fragment Distribution:\n");
+    print(@group_fragments);
+    
+    printf("\nAllocation Criteria Distribution:\n");
+    print(@allocation_orders);
+    print(@scan_calls);
+    
+    // Reset counters
+    @extent_splits = 0;
+    @successful_merges = 0;
+    @merge_attempts = 0;
+    @small_extents = 0;
+    @small_allocations = 0;
+    @highly_fragmented_groups = 0;
+    @high_criteria_allocations = 0;
+    @discard_prealloc = 0;
+}
+
+END {
+    printf("\n=== Final Fragmentation Analysis ===\n");
+    printf("\nExtent Size Distribution:\n");
+    print(@extent_sizes);
+    
+    printf("\nAllocation Size Distribution:\n");
+    print(@allocation_sizes);
+    
+    printf("\nGroup Fragment Distribution:\n");
+    print(@group_fragments);
+    
+    printf("\nAllocation Order Distribution:\n");
+    print(@allocation_orders);
+    
+    printf("\nScan Calls by Criteria:\n");
+    print(@scan_calls);
+    
+    // Calculate fragmentation index
+    $total_extents = 0;
+    $small_extent_ratio = @small_extents * 100 / (@extent_splits + 1);
+    printf("\nFragmentation Index: %d%% small extents\n", $small_extent_ratio);
+    
+    if ($small_extent_ratio > 20) {
+        printf("WARNING: High fragmentation detected. Consider running e4defrag\n");
+    }
+    
+    clear(@extent_sizes);
+    clear(@allocation_sizes);
+    clear(@group_fragments);
+    clear(@allocation_orders);
+    clear(@scan_calls);
+}

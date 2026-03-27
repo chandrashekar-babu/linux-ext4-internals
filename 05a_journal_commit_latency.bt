@@ -1,0 +1,25 @@
+#!/usr/bin/env bpftrace
+
+BEGIN {
+    printf("Monitoring JBD2 journal commit latency (ms)...\n");
+}
+
+tracepoint:jbd2:jbd2_start_commit
+{
+    @commit_start[args->dev] = nsecs;
+}
+
+tracepoint:jbd2:jbd2_commit_flushing
+/@commit_start[args->dev]/
+{
+    $dur_ms = (nsecs - @commit_start[args->dev]) / 1000000;
+    
+    printf("[%s] JBD2 Commit on dev %d took %d ms\n", comm, args->dev, $dur_ms);
+    @commit_times_ms = hist($dur_ms);
+    
+    delete(@commit_start[args->dev]);
+}
+
+END {
+    clear(@commit_start);
+}

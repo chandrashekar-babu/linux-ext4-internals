@@ -1,0 +1,18 @@
+#!/usr/bin/env bpftrace
+
+BEGIN {
+    printf("Watching Ext4 block allocations (mballoc)...\n");
+    printf("%-8s %-16s %-10s %-8s %-8s %-8s\n", "TIME", "COMM", "INODE", "REQUEST", "ALLOC", "GROUP");
+}
+
+/* Attach to the pre-existing tracepoint in mballoc.c */
+tracepoint:ext4:ext4_mballoc_alloc
+{
+    time("%H:%M:%S ");
+    printf("%-16s %-10d %-8d %-8d %-8d\n", 
+           comm, 
+           args->ino, 
+           args->orig_len,  // What the user asked for
+           args->len,       // What mballoc actually found
+           args->group);    // The block group it was placed in
+}

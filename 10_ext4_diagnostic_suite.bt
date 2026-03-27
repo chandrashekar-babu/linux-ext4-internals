@@ -1,0 +1,249 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_diagnostic_suite.bt - Complete Ext4 diagnostic tool
+ * 
+ * Combines multiple monitoring aspects for comprehensive diagnosis
+ * Usage: bpftrace ext4_diagnostic_suite.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Diagnostic Suite Started ===\n");
+    printf("Monitoring all aspects of Ext4 behavior\n\n");
+    
+    // Initialize counters
+    @start_time = nsecs;
+}
+
+// ============ ERROR DETECTION ============
+
+kprobe:ext4_error
+{
+    $sb = (struct super_block *)arg0;
+    $function = (char *)arg1;
+    $message = (char *)arg2;
+    
+    @errors_detected = count();
+    @error_messages[str($function), str($message)] = count();
+    
+    printf("!!! EXT4 ERROR: %s: %s\n", str($function), str($message));
+    printf("    Time: %u ms\n", (nsecs - @start_time) / 1000000);
+}
+
+kprobe:ext4_warning
+{
+    $sb = (struct super_block *)arg0;
+    $function = (char *)arg1;
+    $message = (char *)arg2;
+    
+    @warnings_detected = count();
+    printf("WARNING: %s: %s\n", str($function), str($message));
+}
+
+kprobe:ext4_msg
+{
+    $sb = (struct super_block *)arg0;
+    $level = arg1;
+    $fmt = (char *)arg2;
+    
+    @messages[$level, str($fmt)] = count();
+}
+
+// ============ PERFORMANCE METRICS ============
+
+// Track I/O latency
+kprobe:ext4_file_read_iter
+{
+    @read_start[tid] = nsecs;
+}
+
+kretprobe:ext4_file_read_iter
+/@read_start[tid]/
+{
+    $latency = (nsecs - @read_start[tid]) / 1000;
+    @read_latency_hist = hist($latency);
+    @read_latency_total = avg($latency);
+    @read_latency_max = max($latency);
+    delete(@read_start[tid]);
+}
+
+kprobe:ext4_file_write_iter
+{
+    @write_start[tid] = nsecs;
+}
+
+kretprobe:ext4_file_write_iter
+/@write_start[tid]/
+{
+    $latency = (nsecs - @write_start[tid]) / 1000;
+    @write_latency_hist = hist($latency);
+    @write_latency_total = avg($latency);
+    @write_latency_max = max($latency);
+    delete(@write_start[tid]);
+}
+
+// ============ RESOURCE USAGE ============
+
+// Track allocations
+kprobe:ext4_mb_new_blocks
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $len = $ac->ac_g_ex.fe_len;
+    
+    @allocations = count();
+    @allocated_blocks = sum($len);
+    @allocation_sizes = hist($len);
+}
+
+// Track journal commits
+kprobe:jbd2_journal_commit_transaction
+{
+    @commits = count();
+}
+
+kretprobe:jbd2_journal_commit_transaction
+{
+    @commits_completed = count();
+}
+
+// Track inode operations
+kprobe:ext4_new_inode
+{
+    @inode_creates = count();
+}
+
+kprobe:ext4_free_inode
+{
+    @inode_destroys = count();
+}
+
+// ============ HEALTH INDICATORS ============
+
+// Monitor free space
+kprobe:ext4_has_free_blocks
+{
+    $sbi = (struct ext4_sb_info *)arg0;
+    $nblocks = arg1;
+    $free = $sbi->s_freeblocks_counter;
+    
+    @free_space_checks = count();
+    @free_space_values = hist($free);
+    
+    if ($free < $nblocks * 2) {
+        @low_space_events = count();
+        printf("LOW SPACE: free=%d, needed=%d\n", $free, $nblocks);
+    }
+}
+
+// Monitor fragmentation
+kprobe:ext4_ext_split
+{
+    @extent_splits = count();
+}
+
+kprobe:ext4_ext_try_to_merge
+{
+    @merge_attempts = count();
+}
+
+kretprobe:ext4_ext_try_to_merge
+{
+    if (retval == 1) {
+        @successful_merges = count();
+    }
+}
+
+// ============ REPORTING ============
+
+interval:s:30
+{
+    printf("\n=== Diagnostic Report (30s) ===\n");
+    printf("\nErrors: %d\n", @errors_detected);
+    printf("Warnings: %d\n", @warnings_detected);
+    
+    printf("\nI/O Latency (us):\n");
+    printf("  Read Avg: %d, Max: %d\n", @read_latency_total, @read_latency_max);
+    printf("  Write Avg: %d, Max: %d\n", @write_latency_total, @write_latency_max);
+    
+    printf("\nResources:\n");
+    printf("  Allocations: %d, Blocks: %d\n", @allocations, @allocated_blocks);
+    printf("  Inode Creates: %d, Destroys: %d\n", @inode_creates, @inode_destroys);
+    printf("  Journal Commits: %d\n", @commits);
+    
+    printf("\nHealth:\n");
+    printf("  Extent Splits: %d\n", @extent_splits);
+    printf("  Merges: %d/%d\n", @successful_merges, @merge_attempts);
+    printf("  Low Space Events: %d\n", @low_space_events);
+    
+    // Reset performance counters
+    @read_latency_total = 0;
+    @read_latency_max = 0;
+    @write_latency_total = 0;
+    @write_latency_max = 0;
+    @allocations = 0;
+    @allocated_blocks = 0;
+    @inode_creates = 0;
+    @inode_destroys = 0;
+    @commits = 0;
+    @extent_splits = 0;
+    @merge_attempts = 0;
+    @successful_merges = 0;
+    @low_space_events = 0;
+}
+
+END {
+    printf("\n=== Final Diagnostic Report ===\n");
+    printf("\nRuntime: %d seconds\n", (nsecs - @start_time) / 1000000000);
+    
+    printf("\nError Summary:\n");
+    print(@error_messages);
+    
+    printf("\nWarning Summary:\n");
+    print(@warnings_detected);
+    
+    printf("\nMessage Summary:\n");
+    print(@messages);
+    
+    printf("\nPerformance Metrics:\n");
+    printf("Read Latency Distribution (us):\n");
+    print(@read_latency_hist);
+    printf("Write Latency Distribution (us):\n");
+    print(@write_latency_hist);
+    
+    printf("\nResource Usage:\n");
+    printf("Allocation Size Distribution (blocks):\n");
+    print(@allocation_sizes);
+    printf("Free Space Distribution (blocks):\n");
+    print(@free_space_values);
+    
+    printf("\nHealth Assessment:\n");
+    $split_rate = @extent_splits * 100 / (@successful_merges + 1);
+    printf("Extent Split Rate: %d%%\n", $split_rate);
+    
+    if ($split_rate > 30) {
+        printf("WARNING: High extent split rate indicates fragmentation\n");
+        printf("Recommendation: Run e4defrag or adjust allocation policies\n");
+    }
+    
+    if (@low_space_events > 0) {
+        printf("WARNING: Low space events detected\n");
+        printf("Recommendation: Free up space or increase filesystem size\n");
+    }
+    
+    if (@read_latency_max > 100000) {
+        printf("WARNING: High read latency detected (>100ms)\n");
+        printf("Recommendation: Check storage device health\n");
+    }
+    
+    if (@write_latency_max > 100000) {
+        printf("WARNING: High write latency detected (>100ms)\n");
+        printf("Recommendation: Check storage device health and journal settings\n");
+    }
+    
+    clear(@error_messages);
+    clear(@warnings_detected);
+    clear(@messages);
+    clear(@read_latency_hist);
+    clear(@write_latency_hist);
+    clear(@allocation_sizes);
+    clear(@free_space_values);
+}

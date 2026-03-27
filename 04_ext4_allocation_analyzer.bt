@@ -1,0 +1,170 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_allocation_analyzer.bt - Analyze block allocation behavior
+ * 
+ * Tracks: allocation sizes, fragmentation, preallocation usage
+ * Usage: bpftrace ext4_allocation_analyzer.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Allocation Analyzer Started ===\n");
+}
+
+// Track multiblock allocations
+kprobe:ext4_mb_new_blocks
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $len = $ac->ac_g_ex.fe_len;
+    
+    @alloc_requests = count();
+    @alloc_sizes = hist($len);
+    @alloc_total_blocks = sum($len);
+    
+    // Track by process
+    @alloc_by_proc[comm] = sum($len);
+    @alloc_count_by_proc[comm] = count();
+}
+
+kretprobe:ext4_mb_new_blocks
+{
+    if (retval > 0) {
+        @alloc_success = count();
+        @alloc_blocks = sum(retval);
+    } else {
+        @alloc_failures = count();
+    }
+}
+
+// Track allocation goals
+kprobe:ext4_mb_initialize_context
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $goal = $ac->ac_g_ex.fe_len;
+    
+    @goal_sizes = hist($goal);
+}
+
+// Track preallocation usage
+kprobe:ext4_mb_get_pa
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $pa = $ac->ac_pa;
+    
+    if ($pa != 0) {
+        @prealloc_hits = count();
+        @prealloc_by_proc[comm] = count();
+    }
+}
+
+kprobe:ext4_mb_new_preallocation
+{
+    @prealloc_creates = count();
+}
+
+// Track fragmentation
+kprobe:ext4_mb_find_by_order
+{
+    $ac = (struct ext4_allocation_context *)arg0;
+    $cr = arg2;  // Criteria level
+    
+    @allocation_criteria[$cr] = count();
+}
+
+// Track ENOSPC events
+kprobe:ext4_mb_discard_preallocations
+{
+    @discard_calls = count();
+}
+
+kprobe:ext4_has_free_blocks
+{
+    $sbi = (struct ext4_sb_info *)arg0;
+    $nblocks = arg1;
+    
+    @free_checks = count();
+    @free_check_sizes = hist($nblocks);
+}
+
+// Track delayed allocation
+kprobe:ext4_da_reserve_space
+{
+    $inode = (struct inode *)arg0;
+    $len = arg1;
+    
+    @da_reservations = count();
+    @da_reserved_blocks = sum($len);
+    @da_reserve_sizes = hist($len);
+}
+
+kprobe:ext4_da_release_space
+{
+    $len = arg1;
+    @da_releases = count();
+    @da_released_blocks = sum($len);
+}
+
+// Periodic reporting
+interval:s:15
+{
+    printf("\n=== Allocation Report (15s) ===\n");
+    printf("Allocation Requests: %d\n", @alloc_requests);
+    printf("Successful Allocations: %d\n", @alloc_success);
+    printf("Allocation Failures: %d\n", @alloc_failures);
+    printf("Total Blocks Allocated: %d\n", @alloc_blocks);
+    printf("Preallocation Hits: %d\n", @prealloc_hits);
+    printf("Preallocation Creates: %d\n", @prealloc_creates);
+    printf("Discard Calls: %d\n", @discard_calls);
+    printf("Free Space Checks: %d\n", @free_checks);
+    
+    printf("\nDelayed Allocation:\n");
+    printf("  Reservations: %d\n", @da_reservations);
+    printf("  Reserved Blocks: %d\n", @da_reserved_blocks);
+    printf("  Releases: %d\n", @da_releases);
+    printf("  Released Blocks: %d\n", @da_released_blocks);
+    
+    // Reset counters
+    @alloc_requests = 0;
+    @alloc_success = 0;
+    @alloc_failures = 0;
+    @alloc_blocks = 0;
+    @prealloc_hits = 0;
+    @prealloc_creates = 0;
+    @discard_calls = 0;
+    @free_checks = 0;
+    @da_reservations = 0;
+    @da_reserved_blocks = 0;
+    @da_releases = 0;
+    @da_released_blocks = 0;
+}
+
+END {
+    printf("\n=== Final Allocation Statistics ===\n");
+    printf("\nAllocation sizes (blocks):\n");
+    print(@alloc_sizes);
+    
+    printf("\nGoal sizes (blocks):\n");
+    print(@goal_sizes);
+    
+    printf("\nDelayed allocation reserve sizes:\n");
+    print(@da_reserve_sizes);
+    
+    printf("\nAllocation criteria distribution:\n");
+    print(@allocation_criteria);
+    
+    printf("\nAllocations by process (blocks):\n");
+    print(@alloc_by_proc);
+    
+    printf("\nAllocation count by process:\n");
+    print(@alloc_count_by_proc);
+    
+    printf("\nPreallocation hits by process:\n");
+    print(@prealloc_by_proc);
+    
+    clear(@alloc_sizes);
+    clear(@goal_sizes);
+    clear(@da_reserve_sizes);
+    clear(@allocation_criteria);
+    clear(@alloc_by_proc);
+    clear(@alloc_count_by_proc);
+    clear(@prealloc_by_proc);
+}

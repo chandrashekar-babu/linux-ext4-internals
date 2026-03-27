@@ -1,0 +1,178 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_journal_monitor.bt - Monitor JBD2 journal activity
+ * 
+ * Tracks: transaction starts, commits, checkpoints, recovery
+ * Usage: bpftrace ext4_journal_monitor.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Journal Monitor Started ===\n");
+}
+
+// Track transaction start
+kprobe:jbd2_journal_start
+{
+    $journal = (journal_t *)arg0;
+    $nblocks = arg1;
+    
+    @transactions_started = count();
+    @transactions_by_pid[pid] = count();
+    @transactions_blocks = sum($nblocks);
+    
+    printf("[%u] Transaction started: pid=%d, blocks=%d\n", 
+           elapsed / 1e6, pid, $nblocks);
+}
+
+// Track transaction commit
+kprobe:jbd2_journal_commit_transaction
+{
+    $journal = (journal_t *)arg0;
+    $transaction = (transaction_t *)arg1;
+    $tid = $transaction->t_tid;
+    
+    @commits_started = count();
+    @commit_tid[$tid] = nsecs;
+    
+    printf("[%u] Commit started: tid=%u\n", elapsed / 1e6, $tid);
+}
+
+kretprobe:jbd2_journal_commit_transaction
+/@commit_tid[tid]/
+{
+    $tid = tid;  // Need to capture tid properly
+    $duration = (nsecs - @commit_tid[tid]) / 1000000;
+    
+    @commit_durations_ms = hist($duration);
+    @commit_duration_avg = avg($duration);
+    @commits_completed = count();
+    
+    printf("[%u] Commit completed: tid=%u, duration=%d ms\n", 
+           elapsed / 1e6, $tid, $duration);
+    
+    delete(@commit_tid[tid]);
+}
+
+// Track checkpointing
+kprobe:jbd2_journal_destroy_checkpoint
+{
+    @checkpoint_starts = count();
+}
+
+kretprobe:jbd2_journal_destroy_checkpoint
+{
+    @checkpoints_completed = count();
+}
+
+// Track journal recovery
+kprobe:jbd2_journal_recover
+{
+    @recoveries = count();
+    printf("[%u] JOURNAL RECOVERY STARTED\n", elapsed / 1e6);
+}
+
+kretprobe:jbd2_journal_recover
+{
+    printf("[%u] JOURNAL RECOVERY COMPLETED\n", elapsed / 1e6);
+}
+
+// Track journal I/O
+kprobe:jbd2_journal_write_metadata_buffer
+{
+    @journal_writes = count();
+    @journal_write_bytes = sum(arg3);
+}
+
+kprobe:jbd2_journal_read_metadata_buffer
+{
+    @journal_reads = count();
+    @journal_read_bytes = sum(arg3);
+}
+
+// Track journal space usage
+kprobe:jbd2_journal_get_write_access
+{
+    $handle = (handle_t *)arg0;
+    $transaction = $handle->h_transaction;
+    
+    if ($transaction != 0) {
+        @journal_reservations = count();
+        @journal_credits_used = sum($handle->h_buffer_credits);
+    }
+}
+
+// Track journal failures
+kprobe:jbd2_journal_abort
+{
+    $journal = (journal_t *)arg0;
+    $errno = arg1;
+    
+    @aborts = count();
+    printf("[%u] JOURNAL ABORT: errno=%d\n", elapsed / 1e6, $errno);
+}
+
+// Journal statistics per device
+kprobe:jbd2_journal_init_dev
+{
+    $journal = (journal_t *)arg0;
+    $bdev = $journal->j_dev;
+    
+    if ($bdev != 0) {
+        $devname = $bdev->bd_disk->disk_name;
+        @journal_devices[str($devname)] = count();
+    }
+}
+
+// Periodic reporting
+interval:s:20
+{
+    printf("\n=== Journal Report (20s) ===\n");
+    printf("Transactions Started: %d\n", @transactions_started);
+    printf("Commits Started: %d\n", @commits_started);
+    printf("Commits Completed: %d\n", @commits_completed);
+    printf("Checkpoints Started: %d\n", @checkpoint_starts);
+    printf("Checkpoints Completed: %d\n", @checkpoints_completed);
+    printf("Journal Aborts: %d\n", @aborts);
+    printf("Journal Recoveries: %d\n", @recoveries);
+    
+    printf("\nJournal I/O:\n");
+    printf("  Writes: %d, Bytes: %d\n", @journal_writes, @journal_write_bytes);
+    printf("  Reads: %d, Bytes: %d\n", @journal_reads, @journal_read_bytes);
+    printf("  Credits Used: %d\n", @journal_credits_used);
+    
+    printf("\nCommit Duration (ms):\n");
+    print(@commit_durations_ms);
+    printf("Avg Commit Duration: %d ms\n", @commit_duration_avg);
+    
+    // Reset counters
+    @transactions_started = 0;
+    @commits_started = 0;
+    @commits_completed = 0;
+    @checkpoint_starts = 0;
+    @checkpoints_completed = 0;
+    @aborts = 0;
+    @recoveries = 0;
+    @journal_writes = 0;
+    @journal_write_bytes = 0;
+    @journal_reads = 0;
+    @journal_read_bytes = 0;
+    @journal_credits_used = 0;
+}
+
+END {
+    printf("\n=== Final Journal Statistics ===\n");
+    printf("Total Transactions Started: %d\n", @transactions_started);
+    printf("Total Commits: %d\n", @commits_started);
+    printf("Total Checkpoints: %d\n", @checkpoint_starts);
+    printf("Total Aborts: %d\n", @aborts);
+    printf("Total Recoveries: %d\n", @recoveries);
+    
+    printf("\nCommit Duration Distribution (ms):\n");
+    print(@commit_durations_ms);
+    
+    printf("\nJournal Devices:\n");
+    print(@journal_devices);
+    
+    clear(@commit_durations_ms);
+    clear(@journal_devices);
+}

@@ -1,0 +1,116 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_basic_monitor.bt - Monitor basic Ext4 operations
+ * 
+ * Tracks: file opens, reads, writes, fsync, and errors
+ * Usage: bpftrace ext4_basic_monitor.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Basic Monitor Started ===\n");
+    printf("%-12s %-12s %-16s %-20s %s\n", 
+           "TIME", "PID", "COMM", "OPERATION", "PATH/FILE");
+}
+
+// Track file opens
+kprobe:ext4_file_open
+{
+    $file = (struct file *)arg0;
+    $dentry = $file->f_path.dentry;
+    $name = $dentry->d_name.name;
+    
+    printf("%-12u %-12d %-16s %-20s %s\n", 
+           elapsed / 1e6, pid, comm, "OPEN", str($name));
+    
+    @opens[comm] = count();
+}
+
+// Track reads
+kprobe:ext4_file_read_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $file = $iocb->ki_filp;
+    $dentry = $file->f_path.dentry;
+    $name = $dentry->d_name.name;
+    $size = ((struct iov_iter *)arg1)->count;
+    
+    printf("%-12u %-12d %-16s %-20s size=%d\n", 
+           elapsed / 1e6, pid, comm, "READ", str($name), $size);
+    
+    @read_bytes[comm] = sum($size);
+    @read_ops[comm] = count();
+}
+
+// Track writes
+kprobe:ext4_file_write_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $file = $iocb->ki_filp;
+    $dentry = $file->f_path.dentry;
+    $name = $dentry->d_name.name;
+    $size = ((struct iov_iter *)arg1)->count;
+    
+    printf("%-12u %-12d %-16s %-20s size=%d\n", 
+           elapsed / 1e6, pid, comm, "WRITE", str($name), $size);
+    
+    @write_bytes[comm] = sum($size);
+    @write_ops[comm] = count();
+}
+
+// Track fsync
+kprobe:ext4_sync_file
+{
+    $file = (struct file *)arg0;
+    $dentry = $file->f_path.dentry;
+    $name = $dentry->d_name.name;
+    
+    printf("%-12u %-12d %-16s %-20s %s\n", 
+           elapsed / 1e6, pid, comm, "FSYNC", str($name));
+    
+    @fsync_ops[comm] = count();
+}
+
+// Track errors
+kprobe:ext4_error
+{
+    $sb = (struct super_block *)arg0;
+    $function = (char *)arg1;
+    $message = (char *)arg2;
+    
+    printf("%-12u %-12d %-16s %-20s %s: %s\n", 
+           elapsed / 1e6, pid, comm, "ERROR", 
+           str($function), str($message));
+    
+    @errors[comm] = count();
+}
+
+// Summary on exit
+END {
+    printf("\n=== Summary ===\n");
+    printf("\nOpen operations by process:\n");
+    print(@opens);
+    
+    printf("\nRead operations:\n");
+    print(@read_ops);
+    printf("\nRead bytes:\n");
+    print(@read_bytes);
+    
+    printf("\nWrite operations:\n");
+    print(@write_ops);
+    printf("\nWrite bytes:\n");
+    print(@write_bytes);
+    
+    printf("\nFsync operations:\n");
+    print(@fsync_ops);
+    
+    printf("\nErrors:\n");
+    print(@errors);
+    
+    clear(@opens);
+    clear(@read_bytes);
+    clear(@read_ops);
+    clear(@write_bytes);
+    clear(@write_ops);
+    clear(@fsync_ops);
+    clear(@errors);
+}

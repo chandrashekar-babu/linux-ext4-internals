@@ -1,0 +1,13 @@
+#!/usr/bin/env bpftrace
+
+BEGIN {
+    printf("Listening for ext4_error() events...\n");
+}
+
+kprobe:ext4_error
+{
+    printf("\n CRITICAL: ext4_error triggered!\n");
+    printf("Process: %s (PID %d)\n", comm, pid);
+    printf("Kernel Stack Trace:\n");
+    kstack;
+}

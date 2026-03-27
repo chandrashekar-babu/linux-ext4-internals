@@ -1,0 +1,27 @@
+#!/usr/bin/env bpftrace
+
+BEGIN {
+    printf("Tracing Ext4 write latency... Hit Ctrl-C to end.\n");
+}
+
+/* Hook the entry of the write function to record the start time */
+kprobe:ext4_file_write_iter
+{
+    @start[tid] = nsecs;
+}
+
+/* Hook the return to calculate duration and populate the histogram */
+kretprobe:ext4_file_write_iter
+/@start[tid]/
+{
+    $duration_us = (nsecs - @start[tid]) / 1000;
+    
+    // Create a histogram of the latency
+    @write_latency_us = hist($duration_us);
+    
+    delete(@start[tid]);
+}
+
+END {
+    clear(@start);
+}

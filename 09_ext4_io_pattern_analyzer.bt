@@ -1,0 +1,247 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_io_pattern_analyzer.bt - Analyze I/O patterns
+ * 
+ * Tracks: sequential vs random I/O, access patterns
+ * Usage: bpftrace ext4_io_pattern_analyzer.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 I/O Pattern Analyzer ===\n");
+    printf("Analyzing read/write patterns\n\n");
+}
+
+// Track read positions to detect patterns
+kprobe:ext4_file_read_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $pos = $iocb->ki_pos;
+    
+    @read_positions[tid] = $pos;
+}
+
+kretprobe:ext4_file_read_iter
+/@read_positions[tid]/
+{
+    $iocb = (struct kiocb *)arg0;
+    $size = ((struct iov_iter *)arg1)->count;
+    $new_pos = $iocb->ki_pos;
+    $old_pos = @read_positions[tid];
+    $diff = $new_pos - $old_pos;
+    
+    // Detect sequential vs random
+    if ($diff == $size) {
+        @sequential_reads = count();
+    } else if ($diff != 0) {
+        @random_reads = count();
+        @random_read_offsets = hist($diff);
+    }
+    
+    // Track read sizes
+    @read_sizes = hist($size);
+    @reads_by_process[comm] = count();
+    @read_bytes_by_process[comm] = sum($size);
+    
+    delete(@read_positions[tid]);
+}
+
+// Track write positions
+kprobe:ext4_file_write_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $pos = $iocb->ki_pos;
+    
+    @write_positions[tid] = $pos;
+}
+
+kretprobe:ext4_file_write_iter
+/@write_positions[tid]/
+{
+    $iocb = (struct kiocb *)arg0;
+    $size = ((struct iov_iter *)arg1)->count;
+    $new_pos = $iocb->ki_pos;
+    $old_pos = @write_positions[tid];
+    $diff = $new_pos - $old_pos;
+    
+    // Detect sequential vs random
+    if ($diff == $size) {
+        @sequential_writes = count();
+    } else if ($diff != 0) {
+        @random_writes = count();
+        @random_write_offsets = hist($diff);
+    }
+    
+    // Track write sizes
+    @write_sizes = hist($size);
+    @writes_by_process[comm] = count();
+    @write_bytes_by_process[comm] = sum($size);
+    
+    delete(@write_positions[tid]);
+}
+
+// Track I/O alignment
+kprobe:ext4_file_read_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $pos = $iocb->ki_pos;
+    $size = ((struct iov_iter *)arg1)->count;
+    
+    // Check alignment
+    if ($pos & 4095) {
+        @unaligned_reads = count();
+        @unaligned_read_offsets = hist($pos & 4095);
+    }
+    
+    if ($size & 4095) {
+        @unaligned_read_sizes = count();
+    }
+}
+
+kprobe:ext4_file_write_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    $pos = $iocb->ki_pos;
+    $size = ((struct iov_iter *)arg1)->count;
+    
+    if ($pos & 4095) {
+        @unaligned_writes = count();
+        @unaligned_write_offsets = hist($pos & 4095);
+    }
+    
+    if ($size & 4095) {
+        @unaligned_write_sizes = count();
+    }
+}
+
+// Track direct I/O vs buffered
+kprobe:ext4_file_read_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    
+    if ($iocb->ki_flags & IOCB_DIRECT) {
+        @direct_reads = count();
+    } else {
+        @buffered_reads = count();
+    }
+}
+
+kprobe:ext4_file_write_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    
+    if ($iocb->ki_flags & IOCB_DIRECT) {
+        @direct_writes = count();
+    } else {
+        @buffered_writes = count();
+    }
+}
+
+// Track synchronous vs asynchronous
+kprobe:ext4_file_write_iter
+{
+    $iocb = (struct kiocb *)arg0;
+    
+    if ($iocb->ki_flags & IOCB_SYNC) {
+        @sync_writes = count();
+    }
+    
+    if ($iocb->ki_flags & IOCB_DSYNC) {
+        @dsync_writes = count();
+    }
+}
+
+// Periodic reporting
+interval:s:20
+{
+    printf("\n=== I/O Pattern Report (20s) ===\n");
+    printf("\nRead Patterns:\n");
+    printf("  Sequential: %d\n", @sequential_reads);
+    printf("  Random: %d\n", @random_reads);
+    printf("  Direct: %d\n", @direct_reads);
+    printf("  Buffered: %d\n", @buffered_reads);
+    printf("  Unaligned: %d\n", @unaligned_reads);
+    printf("  Unaligned Sizes: %d\n", @unaligned_read_sizes);
+    
+    printf("\nWrite Patterns:\n");
+    printf("  Sequential: %d\n", @sequential_writes);
+    printf("  Random: %d\n", @random_writes);
+    printf("  Direct: %d\n", @direct_writes);
+    printf("  Buffered: %d\n", @buffered_writes);
+    printf("  Sync: %d\n", @sync_writes);
+    printf("  DSync: %d\n", @dsync_writes);
+    printf("  Unaligned: %d\n", @unaligned_writes);
+    printf("  Unaligned Sizes: %d\n", @unaligned_write_sizes);
+    
+    printf("\nRead Sizes (bytes):\n");
+    print(@read_sizes);
+    printf("\nWrite Sizes (bytes):\n");
+    print(@write_sizes);
+    
+    printf("\nTop Processes by I/O:\n");
+    printf("Reads:\n");
+    print(@reads_by_process, 5);
+    printf("Writes:\n");
+    print(@writes_by_process, 5);
+    
+    // Reset counters
+    @sequential_reads = 0;
+    @random_reads = 0;
+    @sequential_writes = 0;
+    @random_writes = 0;
+    @direct_reads = 0;
+    @buffered_reads = 0;
+    @direct_writes = 0;
+    @buffered_writes = 0;
+    @sync_writes = 0;
+    @dsync_writes = 0;
+    @unaligned_reads = 0;
+    @unaligned_read_sizes = 0;
+    @unaligned_writes = 0;
+    @unaligned_write_sizes = 0;
+    clear(@read_sizes);
+    clear(@write_sizes);
+    clear(@reads_by_process);
+    clear(@writes_by_process);
+}
+
+END {
+    printf("\n=== Final I/O Pattern Analysis ===\n");
+    printf("\nRead Size Distribution:\n");
+    print(@read_sizes);
+    
+    printf("\nWrite Size Distribution:\n");
+    print(@write_sizes);
+    
+    printf("\nRandom Read Offset Distribution:\n");
+    print(@random_read_offsets);
+    
+    printf("\nRandom Write Offset Distribution:\n");
+    print(@random_write_offsets);
+    
+    printf("\nUnaligned Read Offsets:\n");
+    print(@unaligned_read_offsets);
+    
+    printf("\nUnaligned Write Offsets:\n");
+    print(@unaligned_write_offsets);
+    
+    printf("\nTotal I/O by Process:\n");
+    printf("Reads:\n");
+    print(@reads_by_process);
+    printf("Read Bytes:\n");
+    print(@read_bytes_by_process);
+    printf("Writes:\n");
+    print(@writes_by_process);
+    printf("Write Bytes:\n");
+    print(@write_bytes_by_process);
+    
+    clear(@read_sizes);
+    clear(@write_sizes);
+    clear(@random_read_offsets);
+    clear(@random_write_offsets);
+    clear(@unaligned_read_offsets);
+    clear(@unaligned_write_offsets);
+    clear(@reads_by_process);
+    clear(@read_bytes_by_process);
+    clear(@writes_by_process);
+    clear(@write_bytes_by_process);
+}

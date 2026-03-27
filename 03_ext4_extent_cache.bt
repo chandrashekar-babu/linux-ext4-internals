@@ -1,0 +1,142 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_extent_cache.bt - Analyze extent cache behavior
+ * 
+ * Tracks: extent lookups, cache hits/misses, extent splits/merges
+ * Usage: bpftrace ext4_extent_cache.bt
+ */
+
+BEGIN {
+    printf("=== Extent Cache Analysis Started ===\n");
+}
+
+// Track extent lookups
+kprobe:ext4_ext_find_extent
+{
+    @extent_lookups[tid] = count();
+}
+
+kretprobe:ext4_ext_find_extent
+{
+    @extent_lookups_total = count();
+}
+
+// Track extent cache hits (ext4_es_lookup_extent)
+kprobe:ext4_es_lookup_extent
+{
+    @es_lookups[tid] = count();
+}
+
+kretprobe:ext4_es_lookup_extent
+/@es_lookups[tid]/
+{
+    $ret = retval;
+    if ($ret == 1) {
+        @es_cache_hits = count();
+    } else {
+        @es_cache_misses = count();
+    }
+    delete(@es_lookups[tid]);
+}
+
+// Track extent tree operations
+kprobe:ext4_ext_insert_extent
+{
+    @extent_inserts = count();
+    @extent_ops[comm, "INSERT"] = count();
+}
+
+kprobe:ext4_ext_remove_space
+{
+    @extent_removes = count();
+    @extent_ops[comm, "REMOVE"] = count();
+}
+
+kprobe:ext4_ext_try_to_merge
+{
+    @extent_merge_attempts = count();
+}
+
+kretprobe:ext4_ext_try_to_merge
+{
+    if (retval == 1) {
+        @extent_merges = count();
+    }
+}
+
+kprobe:ext4_ext_split
+{
+    @extent_splits = count();
+    @extent_ops[comm, "SPLIT"] = count();
+}
+
+// Track extent cache pressure
+kprobe:ext4_es_shrink
+{
+    @es_shrink_calls = count();
+}
+
+kretprobe:ext4_es_shrink
+{
+    @es_shrunk = sum(retval);
+}
+
+// Track extent allocation goals
+kprobe:ext4_ext_find_goal
+{
+    @extent_goal_searches = count();
+}
+
+// Periodic reporting
+interval:s:10
+{
+    printf("\n=== Extent Cache Report (10s) ===\n");
+    printf("Extent lookups: %d\n", @extent_lookups_total);
+    printf("Extent cache hits: %d\n", @es_cache_hits);
+    printf("Extent cache misses: %d\n", @es_cache_misses);
+    
+    if (@es_cache_hits + @es_cache_misses > 0) {
+        $hit_rate = @es_cache_hits * 100 / (@es_cache_hits + @es_cache_misses);
+        printf("Cache hit rate: %d%%\n", $hit_rate);
+    }
+    
+    printf("\nExtent Operations:\n");
+    printf("  Inserts: %d\n", @extent_inserts);
+    printf("  Removes: %d\n", @extent_removes);
+    printf("  Merges: %d\n", @extent_merges);
+    printf("  Splits: %d\n", @extent_splits);
+    printf("  Merge attempts: %d\n", @extent_merge_attempts);
+    
+    printf("\nExtent Cache Shrinker:\n");
+    printf("  Calls: %d\n", @es_shrink_calls);
+    printf("  Entries shrunk: %d\n", @es_shrunk);
+    
+    // Reset counters
+    @extent_lookups_total = 0;
+    @es_cache_hits = 0;
+    @es_cache_misses = 0;
+    @extent_inserts = 0;
+    @extent_removes = 0;
+    @extent_merges = 0;
+    @extent_splits = 0;
+    @extent_merge_attempts = 0;
+    @es_shrink_calls = 0;
+    @es_shrunk = 0;
+}
+
+END {
+    printf("\n=== Final Extent Cache Statistics ===\n");
+    printf("Total extent lookups: %d\n", @extent_lookups_total);
+    printf("Cache hits: %d\n", @es_cache_hits);
+    printf("Cache misses: %d\n", @es_cache_misses);
+    
+    if (@es_cache_hits + @es_cache_misses > 0) {
+        $hit_rate = @es_cache_hits * 100 / (@es_cache_hits + @es_cache_misses);
+        printf("Overall cache hit rate: %d%%\n", $hit_rate);
+    }
+    
+    printf("\nExtent operations by process:\n");
+    print(@extent_ops);
+    
+    clear(@extent_ops);
+}

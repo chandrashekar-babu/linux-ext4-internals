@@ -1,0 +1,126 @@
+#!/usr/bin/env bpftrace
+/*
+ * ext4_latency_tracker.bt - Track I/O latency for Ext4 operations
+ * 
+ * Measures: read latency, write latency, fsync latency
+ * Outputs: histogram of latencies in microseconds
+ * Usage: bpftrace ext4_latency_tracker.bt
+ */
+
+BEGIN {
+    printf("=== Ext4 Latency Tracker Started ===\n");
+    printf("Tracking read, write, and fsync latencies\n\n");
+}
+
+// Track read latency
+kprobe:ext4_file_read_iter
+{
+    @read_start[tid] = nsecs;
+}
+
+kretprobe:ext4_file_read_iter
+/@read_start[tid]/
+{
+    $latency = (nsecs - @read_start[tid]) / 1000;  // microseconds
+    
+    @read_latency_us = hist($latency);
+    @read_latency_avg = avg($latency);
+    @read_latency_max = max($latency);
+    @read_latency_min = min($latency);
+    
+    delete(@read_start[tid]);
+}
+
+// Track write latency
+kprobe:ext4_file_write_iter
+{
+    @write_start[tid] = nsecs;
+}
+
+kretprobe:ext4_file_write_iter
+/@write_start[tid]/
+{
+    $latency = (nsecs - @write_start[tid]) / 1000;
+    
+    @write_latency_us = hist($latency);
+    @write_latency_avg = avg($latency);
+    @write_latency_max = max($latency);
+    @write_latency_min = min($latency);
+    
+    delete(@write_start[tid]);
+}
+
+// Track fsync latency
+kprobe:ext4_sync_file
+{
+    @fsync_start[tid] = nsecs;
+}
+
+kretprobe:ext4_sync_file
+/@fsync_start[tid]/
+{
+    $latency = (nsecs - @fsync_start[tid]) / 1000;
+    
+    @fsync_latency_us = hist($latency);
+    @fsync_latency_avg = avg($latency);
+    @fsync_latency_max = max($latency);
+    @fsync_latency_min = min($latency);
+    
+    delete(@fsync_start[tid]);
+}
+
+// Track journal commit latency
+kprobe:jbd2_journal_commit_transaction
+{
+    @commit_start[tid] = nsecs;
+}
+
+kretprobe:jbd2_journal_commit_transaction
+/@commit_start[tid]/
+{
+    $latency = (nsecs - @commit_start[tid]) / 1000;
+    
+    @commit_latency_us = hist($latency);
+    @commit_latency_avg = avg($latency);
+    
+    delete(@commit_start[tid]);
+}
+
+// Periodic reporting (every 10 seconds)
+interval:s:10
+{
+    printf("\n=== Latency Report (10s interval) ===\n");
+    printf("Read Latency (us):\n");
+    print(@read_latency_us);
+    printf("Avg: %d us, Max: %d us, Min: %d us\n", 
+           @read_latency_avg, @read_latency_max, @read_latency_min);
+    
+    printf("\nWrite Latency (us):\n");
+    print(@write_latency_us);
+    printf("Avg: %d us, Max: %d us, Min: %d us\n", 
+           @write_latency_avg, @write_latency_max, @write_latency_min);
+    
+    printf("\nFsync Latency (us):\n");
+    print(@fsync_latency_us);
+    printf("Avg: %d us, Max: %d us, Min: %d us\n", 
+           @fsync_latency_avg, @fsync_latency_max, @fsync_latency_min);
+    
+    printf("\nJournal Commit Latency (us):\n");
+    print(@commit_latency_us);
+    printf("Avg: %d us\n", @commit_latency_avg);
+}
+
+END {
+    printf("\n=== Final Latency Summary ===\n");
+    printf("Read Latency (us):\n");
+    print(@read_latency_us);
+    printf("\nWrite Latency (us):\n");
+    print(@write_latency_us);
+    printf("\nFsync Latency (us):\n");
+    print(@fsync_latency_us);
+    
+    clear(@read_start);
+    clear(@write_start);
+    clear(@fsync_start);
+    clear(@commit_start);
+}
